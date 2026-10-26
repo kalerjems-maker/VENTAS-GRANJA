@@ -379,6 +379,7 @@ function load(){
 }
 function persist(){ try{ localStorage.setItem(K, JSON.stringify(db)); }catch(e){ toast('⚠ Memoria llena: quite algunas fotos o exporte un respaldo'); } }
 function save(){
+  db.config.rev = Math.max(Date.now(), (db.config.rev||0) + 1);
   if(db.config.url){ db.config.pend = true; setSync('⏳ Pendiente'); clearTimeout(syncT); syncT = setTimeout(push, 2500); }
   persist();
 }
@@ -2156,13 +2157,51 @@ function payload(){
   var HU = [['Fecha','Recogidos','Rotos','Buenos','Nota']].concat(db.huevos.map(function(x){ return [fLarga(x.fecha), x.cant, x.rotos||0, x.buenos, x.nota||'']; }));
   return {k:db.config.clave||'', tablas:{Pesajes:PE, Huevos:HU, 'Alimento Pollas':AP, Bodega:BO, 'Compras bodega':CO, 'Movimientos bodega':MB, Ventas:V, Productos:P2, Clientes:C, Abonos:A, Entradas:E, Gastos:G, Pedidos:PV, Lotes:LT, 'Movimientos lotes':LM, Mermas:MM}, raw:raw};
 }
-function push(manual){
+function push(manual, forzar){
   if(!db.config.url){ if(manual) toast('Configure la URL de Sheets'); return; }
   if(db.config.needRestore){ if(manual) toast('Primero se deben traer los datos de Sheets'); return; }
   clearTimeout(syncT); setSync('🔄 Enviando...');
+  if(!forzar && db.config.clave){
+    // Antes de enviar, revisar que nadie haya guardado algo más nuevo desde otro celular
+    return revRemota(function(rr){
+      if(rr > (db.config.syncRev||0) && rr !== db.config.rev) return conflicto();
+      push(manual, true);
+    }, function(){ setSync('⚠ Sin conexión'); if(manual) toast('Sin conexión'); });
+  }
+  var revEnv = db.config.rev || 0;
   fetch(db.config.url, {method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain'}, body:JSON.stringify(payload())})
-    .then(function(){ db.config.last = new Date().toISOString(); db.config.pend = false; persist(); estadoSync(); if(tabActual==='conf') rConf(); if(manual) toast('✓ Enviado a Sheets'); })
+    .then(function(){ db.config.last = new Date().toISOString(); db.config.syncRev = revEnv; if(db.config.rev===revEnv) db.config.pend = false; persist(); estadoSync(); if(tabActual==='conf') rConf(); if(manual) toast('✓ Enviado a Sheets'); })
     .catch(function(){ setSync('⚠ Sin conexión'); if(manual) toast('Sin conexión'); });
+}
+function revRemota(cb, err){
+  jsonp(db.config.url+'?action=rev&k='+encodeURIComponent(db.config.clave||''), function(d){ cb(d && d.rev ? +d.rev : 0); }, err);
+}
+var sincronizando = false;
+function sincronizar(despues){
+  if(!db.config.url || !db.config.clave || db.config.needRestore || sincronizando || WK){ if(despues) despues(); return; }
+  sincronizando = true;
+  revRemota(function(rr){
+    sincronizando = false;
+    if(rr > (db.config.syncRev||0) && rr !== db.config.rev){
+      if(db.config.pend) return conflicto();
+      return traerRespaldo(function(){ toast('🔄 Datos actualizados desde el otro celular'); if(despues) despues(); });
+    }
+    if(db.config.pend) push();
+    if(despues) despues();
+  }, function(){ sincronizando = false; if(despues) despues(); });
+}
+function traerRespaldo(fin){
+  setSync('🔄 Actualizando...');
+  jsonp(db.config.url+'?action=load&k='+encodeURIComponent(db.config.clave||''), function(d){
+    if(d && d.productos){ aplicarDatos(d); db.config.syncRev = db.config.rev || 0; db.config.pend = false; persist(); estadoSync(); render(); if(fin) fin(); }
+    else { estadoSync(); toast('No se pudo leer el respaldo (revise el PIN)'); }
+  }, function(){ estadoSync(); });
+}
+function conflicto(){
+  setSync('⚠ Revisar');
+  modal('<h2>⚠ Hay cambios en los dos celulares</h2><p class="mu" style="margin-bottom:12px">Desde el otro celular se guardaron datos nuevos, y en este también hay cambios sin enviar. Escoja con cuál quedarse:</p>'+
+    '<div style="display:flex;flex-direction:column;gap:8px"><button onclick="cerrar();traerRespaldo(function(){ toast(\'✓ Datos del otro celular cargados\'); })">⬇ Traer lo del otro celular<br><span style="font-weight:400;font-size:12px">Se pierden los cambios sin enviar de este celular</span></button>'+
+    '<button class="sec" onclick="cerrar();push(1,true)">⬆ Dejar lo de este celular<br><span style="font-weight:400;font-size:12px">Reemplaza lo que guardó el otro celular</span></button></div>');
 }
 function aplicarDatos(d){
   var url = db.config.url, b = base();
@@ -2180,7 +2219,7 @@ function restaurar(){
   var cb = 'cb'+Date.now(), s = document.createElement('script');
   window[cb] = function(d){
     delete window[cb]; s.remove();
-    if(d && d.productos){ aplicarDatos(d); db.config.pend = false; persist(); estadoSync(); toast('✓ Datos restaurados'); }
+    if(d && d.productos){ aplicarDatos(d); db.config.syncRev = db.config.rev || 0; db.config.pend = false; persist(); estadoSync(); toast('✓ Datos restaurados'); }
     else { estadoSync(); toast('No hay respaldo en Sheets'); }
   };
   s.onerror = function(){ delete window[cb]; estadoSync(); toast('Error al conectar'); };
@@ -2753,7 +2792,7 @@ function wEntrarDueno(){
   var k = hashK(v); toast('Verificando...');
   jsonp(WK.url+'?action=load&k='+encodeURIComponent(k), function(d){
     if(!d || !d.productos) return toast('PIN incorrecto');
-    d.config = d.config || {}; d.config.url = WK.url; d.config.clave = k; d.config.pinH = hashPin(v); d.config.pend = false;
+    d.config = d.config || {}; d.config.url = WK.url; d.config.clave = k; d.config.pinH = hashPin(v); d.config.pend = false; d.config.syncRev = d.config.rev || 0;
     try{ localStorage.setItem(K, JSON.stringify(d)); }catch(e){ return toast('No hay espacio en este celular'); }
     entrarDuenoOk();
   }, function(){ toast('Sin conexión'); });
@@ -2772,7 +2811,7 @@ function primerTrab(){ modal('<h2>👷 Trabajador</h2><p class="mu" style="margi
 }
 
 /* ================= exponer funciones (APK median / webintoapp) ================= */
-Object.assign(window, {$:$, okSi:okSi, okNo:okNo, guardarPin:guardarPin, pinRestaurar:pinRestaurar, pinRestaurarOk:pinRestaurarOk, compartirEnlaceTrab:compartirEnlaceTrab, qrTrab:qrTrab, descargarQR:descargarQR, traerEventos:traerEventos,
+Object.assign(window, {$:$, okSi:okSi, okNo:okNo, traerRespaldo:traerRespaldo, push:push, sincronizar:sincronizar, guardarPin:guardarPin, pinRestaurar:pinRestaurar, pinRestaurarOk:pinRestaurarOk, compartirEnlaceTrab:compartirEnlaceTrab, qrTrab:qrTrab, descargarQR:descargarQR, traerEventos:traerEventos,
   wActualizar:wActualizar, wElegirNombre:wElegirNombre, wSetNombre:wSetNombre, wEnviarCola:wEnviarCola, wAlim:wAlim, wGuardarAlim:wGuardarAlim, wPeso:wPeso, wGuardarPeso:wGuardarPeso,
   wMuerte:wMuerte, wGuardarMuerte:wGuardarMuerte, wHuevos:wHuevos, wGuardarHuevos:wGuardarHuevos, wDueno:wDueno, wEntrarDueno:wEntrarDueno, guardarRol:guardarRol, modal:modal, primerTrab:primerTrab, ir:ir, setCatV:setCatV, setCatI:setCatI, rProdGrid:rProdGrid, pedir:pedir, calcPed:calcPed, porValor:porValor,
   agregar:agregar, quitar:quitar, vaciar:vaciar, setTipo:setTipo, registrar:registrar, anular:anular,
@@ -2816,13 +2855,13 @@ else {
   if(nuevo && !leerRol()) primerUso();
   if(db.config.needRestore){
     setSync('🔄 Trayendo datos...');
-    jsonp(db.config.url+'?action=load&k='+encodeURIComponent(db.config.clave||''), function(d){ if(d && d.productos){ aplicarDatos(d); } db.config.needRestore = false; db.config.pend = false; persist(); estadoSync(); render(); toast('✓ Datos del dueño cargados'); }, function(){ toast('No se pudo traer los datos. Revise la conexión y recargue.'); });
+    jsonp(db.config.url+'?action=load&k='+encodeURIComponent(db.config.clave||''), function(d){ if(d && d.productos){ aplicarDatos(d); } db.config.needRestore = false; db.config.syncRev = db.config.rev || 0; db.config.pend = false; persist(); estadoSync(); render(); toast('✓ Datos del dueño cargados'); }, function(){ toast('No se pudo traer los datos. Revise la conexión y recargue.'); });
   } else {
-    if(db.config.url && db.config.pend) push();
-    if(db.config.url) traerEventos();
-    setInterval(function(){ if(navigator.onLine && db.config.url) traerEventos(); }, 300000);
+    if(db.config.url) sincronizar(traerEventos);
+    setInterval(function(){ if(navigator.onLine && db.config.url) sincronizar(traerEventos); }, 180000);
   }
-  window.addEventListener('online', function(){ if(db.config.url && db.config.pend) push(); });
+  document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='visible' && db.config.url && !db.config.needRestore) sincronizar(); });
+  window.addEventListener('online', function(){ if(db.config.url) sincronizar(); });
 }
 if('serviceWorker' in navigator && location.protocol==='https:'){ navigator.serviceWorker.register('sw.js').catch(function(){}); }
 </script>
